@@ -1,0 +1,149 @@
+---
+title: 'Batch2: WG vs. TIP DESEQ2 Data Prep'
+author: "Adam Festa"
+date: "4/5/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+library(readr)
+library(dplyr);library(reshape2); library(pedigree)
+library(DESeq2);library(lme4); library(biomaRt); library(goseq)
+```
+
+## Load counts
+
+Counts were aligned to evi 78k
+
+```{r load.counts}
+## Set WD to load counts ####
+setwd("/domino/datasets/BV_Data/mnt/")
+raw_counts <- read.csv("./cts_78k/cts_evi78k.csv")
+head(colnames(raw_counts))
+```
+
+## Load expiriment data
+
+First load techincal replicate data for Batch 1 and Batch 2; then load Batch 3 experimental.
+
+Subset the biological level experiment data and put in same order as the raw counts
+
+```{r pressure, echo=T}
+## load experimental data for batches and reduce to biological replicate level ####
+load("./Breeding-Value-Prediction/expt.dat.720.RData")
+Batch3_phenos <- read.csv("./Breeding-Value-Prediction/Batch3_phenos.csv")
+Batch3_phenos <- rbind(Batch3_phenos,Batch3_phenos,Batch3_phenos)
+Batch3_phenos$RNA_ID <- as.character(Batch3_phenos$RNA_ID)
+Batch3_phenos$RNA_ID[1:22] <- paste0(Batch3_phenos$RNA_ID[1:22],"_1_1.fq.gz")
+Batch3_phenos$RNA_ID[23:44] <- paste0(Batch3_phenos$RNA_ID[23:44],"_2_1.fq.gz")
+Batch3_phenos$RNA_ID[45:66] <- paste0(Batch3_phenos$RNA_ID[45:66],"_3_1.fq.gz")
+
+head(colnames(expt.dat.720))
+bio_phenos <- unique(expt.dat.720[,c(1,2,17)])
+rm(expt.dat.720)
+bio_phenos <- bio_phenos[which(paste0("Sample_",bio_phenos$animal_id) %in% colnames(raw_counts)),]
+
+head(colnames(Batch3_phenos))
+b3_phenos <- Batch3_phenos[,c(3,1,4)]
+rm(Batch3_phenos)
+colnames(b3_phenos) <- colnames(bio_phenos)
+all_bio_fam <- rbind(bio_phenos,b3_phenos)
+rm(b3_phenos,bio_phenos)
+
+raw_counts <- raw_counts[,match(c(paste0("Sample_",all_bio_fam[1:224,1]),as.character(all_bio_fam[225:290,1])),
+                                colnames(raw_counts))]
+
+all_bio_fam <- droplevels(all_bio_fam)
+all_bio_fam$batch <- as.factor(c(rep("2",80),rep("1",144),rep("3",66)))
+all_bio_fam$seq <-  as.factor(c(rep("1",80),rep("1",144),rep("2",66)))
+
+head(all_bio_fam)
+
+```
+
+## Load pedigree data 
+
+```{r load.ped}
+##make pedigre
+b1_2_ped <- readxl::read_excel("/mnt/pedigree_2018_02_18_17_28_36.xlsx")
+b3_ped <- readxl::read_excel("/mnt/PedigreeOrigins_ValidationSet.xlsx")
+full_ped <- rbind(b1_2_ped,b3_ped[,-6])
+str(full_ped)
+rm(b1_2_ped,b3_ped)
+
+check <- subset(full_ped, !duplicated(Id))
+new_order <- as.numeric(as.factor(check$Id))
+check <- check[order(new_order), ]
+
+has_pars <- which(!is.na(check$`Parent 1`))
+check <- rbind(check[-has_pars,],check[has_pars,])
+
+fs <- as.character(all_bio_fam$fam_id)[which(!as.character(all_bio_fam$fam_id) %in% full_ped$Id)]
+fs_fams <- unlist(strsplit(fs,split = "x"))
+#fs_fams[which(!fs_fams %in% full_ped$Id)]
+fs_fams <- do.call(rbind,strsplit(fs,split="x"))
+
+fs_fams <- data.frame(cbind("Id"=fs,fs_fams,NA,NA))
+fs_fams <- subset(fs_fams, !duplicated(Id))
+colnames(fs_fams) <- colnames(check)
+
+#which(fs_fams$`Parent 1` == fs_fams$`Parent 2`)
+fs_fams$`Parent 1`[1:11] <- NA
+fs_fams$`Parent 2`[1:11] <- NA
+
+full_check_ped <- rbind(check,fs_fams)
+
+uc <- cbind("UC",NA,NA,NA,NA)
+colnames(uc) <- colnames(full_check_ped)
+full_check_ped <- rbind(uc,full_check_ped)
+rm(full_ped,fs_fams,check,uc,fs,has_pars,new_order)
+```
+
+
+## Generate A matrix
+
+Create A matrix to calculate Heritabilty
+
+```{r a.mat}
+A.ped <- data.frame(cbind("fam.id"=(as.character(full_check_ped$Id)),
+                          "p1.animal.id"=(as.character(full_check_ped$`Parent 1`)),
+                          "p2.animal.id"=(as.character(full_check_ped$`Parent 2`))))
+str(A.ped)
+gen_these <- (A.ped$fam.id %in% unique(all_bio_fam$fam_id))
+setwd("/mnt")
+makeA(A.ped,which = gen_these)
+
+A <- read.table("A.txt") %>% acast(.,V1~V2, value.var="V3"); 
+dimnames(A) <- list(A.ped$fam.id[gen_these],A.ped$fam.id[gen_these]); 
+A[upper.tri(A)] <- t(A)[upper.tri(A)]
+rm(gen_these)
+```
+
+
+## Add state info to pedigree
+
+```{r }
+#### add county and state to expt data #####
+idx <- match(as.character(all_bio_fam$fam_id), full_check_ped$Id)
+samp_ped <- full_check_ped[idx,]
+samp_ped$State[which(grepl("WG", samp_ped$Id, fixed = TRUE))] <- "WG"
+samp_ped$State[which(grepl("LSG", samp_ped$Id, fixed = TRUE))] <- "WG"
+samp_ped$State[which(grepl("x", samp_ped$Id, fixed = TRUE))] <- "FS"
+expt_dat <- cbind(all_bio_fam,samp_ped)
+
+rm(samp_ped,idx,all_bio_fam)
+rownames(expt_dat) <- colnames(raw_counts)
+```
+
+
+## Save data set as input
+
+```{r save}
+### data now done #####
+save.image("Data_prep.RData",compress=T)
+```
